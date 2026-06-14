@@ -1,10 +1,12 @@
 import os
 import re
 import json
+import requests
+from bs4 import BeautifulSoup
 import telebot
 
-BOT_TOKEN     = os.environ.get("BOT_TOKEN")
-GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID")
+BOT_TOKEN       = os.environ.get("BOT_TOKEN")
+GROUP_CHAT_ID   = os.environ.get("GROUP_CHAT_ID")
 SENT_LINKS_FILE = "sent_links.json"
 
 if not BOT_TOKEN:
@@ -14,16 +16,59 @@ if not GROUP_CHAT_ID:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Public link  → t.me/groupname
-# Private link → t.me/+XXXX ya t.me/joinchat/XXXX (ignore)
-PUBLIC_TG_REGEX  = r'https?://(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{4,})'
-PRIVATE_TG_REGEX = r'https?://(?:t\.me|telegram\.me)/(?:\+|joinchat/)[^\s]+'
+# Koi bhi t.me link (public ya private)
+TG_LINK_REGEX = r'(https?://(?:t\.me|telegram\.me)/[^\s]+)'
+
+SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
+
+
+# ── Link ka naam fetch karo ────────────────────────────────────────────────────
+
+def get_tg_title(url: str):
+    """
+    t.me preview page se group/channel naam nikalo.
+    - Valid link   → naam (string) return karo
+    - Expired link → None return karo
+    """
+    try:
+        r = requests.get(url, headers=SCRAPE_HEADERS, timeout=8)
+        if r.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # ── Expired / invalid check ────────────────────────────────────────────
+        # Telegram expired links pe yeh class hoti hai
+        desc = soup.find("div", class_="tgme_page_description")
+        if desc and any(x in desc.text.lower() for x in
+                        ["no longer valid", "invalid", "expired", "link is not valid"]):
+            return None
+
+        # ── Naam nikalo ────────────────────────────────────────────────────────
+        # Method 1: og:title meta tag (sabse reliable)
+        og = soup.find("meta", attrs={"property": "og:title"})
+        if og and og.get("content") and og["content"].lower() != "telegram":
+            return og["content"].strip()
+
+        # Method 2: tgme_page_title div (fallback)
+        title_div = soup.find("div", class_="tgme_page_title")
+        if title_div:
+            span = title_div.find("span")
+            if span and span.text.strip():
+                return span.text.strip()
+
+        return None
+
+    except Exception as e:
+        print(f"⚠️  Scrape error [{url}]: {e}")
+        return None
 
 
 # ── Duplicate tracking ─────────────────────────────────────────────────────────
 
 def load_sent_links() -> set:
-    """File se pehle bheje gaye links load karo"""
     try:
         with open(SENT_LINKS_FILE, "r") as f:
             return set(json.load(f))
@@ -31,36 +76,17 @@ def load_sent_links() -> set:
         return set()
 
 def save_sent_links(links: set):
-    """Sent links file mein save karo"""
     with open(SENT_LINKS_FILE, "w") as f:
         json.dump(list(links), f)
 
-# Startup pe load karo
 sent_links = load_sent_links()
 print(f"📋 {len(sent_links)} links pehle se record mein hain.")
-
-
-# ── Telegram API helper ────────────────────────────────────────────────────────
-
-def get_group_title(username: str):
-    """
-    Public group/channel ka naam fetch karo.
-    Agar user/bot hai ya accessible nahi → None return karo.
-    """
-    try:
-        chat = bot.get_chat(f"@{username}")
-        if chat.type in ("group", "supergroup", "channel"):
-            return chat.title
-        return None
-    except Exception as e:
-        print(f"⚠️  get_chat failed for @{username}: {e}")
-        return None
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 print("🔧 Webhook delete kar rahe hain...")
 bot.remove_webhook()
-print("✅ Webhook deleted. Polling shuru...")
+print("✅ Polling shuru...")
 
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
@@ -72,9 +98,9 @@ def handle_start(message):
     bot.reply_to(
         message,
         "👋 Hello!\n\n"
-        "Mujhe kisi Telegram group/channel ka public link bhejo.\n"
+        "Telegram group/channel ka koi bhi link bhejo — public ya private.\n"
         "Main uska naam aur link group mein forward kar dunga. 🔗\n\n"
-        "❌ Expired, request-based aur duplicate links ignore ho jayenge."
+        "❌ Expired aur duplicate links ignore ho jayenge."
     )
 
 
@@ -83,63 +109,56 @@ def handle_message(message):
     global sent_links
     text = message.text
 
-    # Private links — seedha ignore
-    private_links = re.findall(PRIVATE_TG_REGEX, text)
-    public_usernames = re.findall(PUBLIC_TG_REGEX, text)
+    all_links = re.findall(TG_LINK_REGEX, text)
+
+    if not all_links:
+        bot.reply_to(message, "Koi Telegram link nahi mila.\nExample: https://t.me/groupname")
+        return
 
     sent      = 0
-    ignored   = len(private_links)
+    expired   = 0
     duplicate = 0
 
-    for username in public_usernames:
-        link = f"https://t.me/{username}"
+    for url in all_links:
 
         # ── Duplicate check ────────────────────────────────────────────────────
-        if link in sent_links:
+        if url in sent_links:
             duplicate += 1
-            print(f"🔁 Duplicate skip: {link}")
+            print(f"🔁 Duplicate skip: {url}")
             continue
 
-        # ── Group naam fetch karo ──────────────────────────────────────────────
-        title = get_group_title(username)
+        # ── Naam fetch karo ────────────────────────────────────────────────────
+        title = get_tg_title(url)
 
         if title is None:
-            ignored += 1
-            print(f"⏭️  Ignored: @{username}")
+            expired += 1
+            print(f"⏭️  Expired/invalid: {url}")
             continue
 
-        # ── Group chat mein bhejo ──────────────────────────────────────────────
+        # ── Group mein bhejo ───────────────────────────────────────────────────
         try:
             bot.send_message(
                 GROUP_CHAT_ID,
-                f"📢 <b>{title}</b>\n🔗 {link}",
+                f"📢 <b>{title}</b>\n🔗 {url}",
                 parse_mode="HTML"
             )
-            sent_links.add(link)
-            save_sent_links(sent_links)   # file mein save karo
+            sent_links.add(url)
+            save_sent_links(sent_links)
             sent += 1
-            print(f"✅ Forwarded: {title} → {link}")
+            print(f"✅ Forwarded: {title}")
         except Exception as e:
             print(f"❌ Send error: {e}")
-            ignored += 1
 
     # ── User ko reply ──────────────────────────────────────────────────────────
     parts = []
-    if sent > 0:
-        parts.append(f"✅ {sent} group(s) forward ho gaye!")
-    if duplicate > 0:
-        parts.append(f"🔁 {duplicate} pehle se bheja ja chuka hai, skip kiya.")
-    if ignored > 0:
-        parts.append(f"⚠️ {ignored} ignore kiye (expired / request-based / invalid).")
+    if sent:
+        parts.append(f"✅ {sent} link(s) forward ho gaye!")
+    if duplicate:
+        parts.append(f"🔁 {duplicate} pehle se bhej chuke hain, skip kiya.")
+    if expired:
+        parts.append(f"⚠️ {expired} expired ya invalid hain, ignore kiya.")
 
-    if parts:
-        bot.reply_to(message, "\n".join(parts))
-    else:
-        bot.reply_to(
-            message,
-            "Koi valid Telegram link nahi mila.\n"
-            "Example: https://t.me/groupname"
-        )
+    bot.reply_to(message, "\n".join(parts) if parts else "Kuch nahi hua.")
 
 
 # ── Start ──────────────────────────────────────────────────────────────────────
