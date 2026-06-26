@@ -16,7 +16,7 @@ if not GROUP_CHAT_ID:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Koi bhi t.me link (public ya private)
+# Koi bhi t.me link (public ya private) ko dhoondne ke liye regex
 TG_LINK_REGEX = r'(https?://(?:t\.me|telegram\.me)/[^\s]+)'
 
 SCRAPE_HEADERS = {
@@ -40,7 +40,6 @@ def get_tg_title(url: str):
         soup = BeautifulSoup(r.text, "html.parser")
 
         # ── Expired / invalid check ────────────────────────────────────────────
-        # Telegram expired links pe yeh class hoti hai
         desc = soup.find("div", class_="tgme_page_description")
         if desc and any(x in desc.text.lower() for x in
                         ["no longer valid", "invalid", "expired", "link is not valid"]):
@@ -109,6 +108,7 @@ def handle_message(message):
     global sent_links
     text = message.text
 
+    # Message me se saare links ek sath nikal rahe hain (Bulk support)
     all_links = re.findall(TG_LINK_REGEX, text)
 
     if not all_links:
@@ -116,49 +116,58 @@ def handle_message(message):
         return
 
     sent      = 0
-    expired   = 0
     duplicate = 0
+    expired   = 0
 
+    # Ek-ek karke saare links ko check karne ke liye loop
     for url in all_links:
 
-        # ── Duplicate check ────────────────────────────────────────────────────
+        # ── 1. DUPLICATE CHECK (SABSE PEHLE) ───────────────────────────────────
+        # Agar link pehle se sent_links set me hai, toh turant yahi se ignore karo
         if url in sent_links:
             duplicate += 1
-            print(f"🔁 Duplicate skip: {url}")
-            continue
+            print(f"🔁 Duplicate skip kiya (Instant Ignore): {url}")
+            continue  # Yeh turant loop ke agle link par bhej dega
 
-        # ── Naam fetch karo ────────────────────────────────────────────────────
+        # ── 2. EXPIRED / NAME CHECK ───────────────────────────────────────────
+        # Agar duplicate nahi hai, tabhi internet se title check karega (Isse bot fast chalega)
         title = get_tg_title(url)
 
         if title is None:
             expired += 1
-            print(f"⏭️  Expired/invalid: {url}")
-            continue
+            print(f"⏭️  Expired ya Invalid link skip kiya: {url}")
+            continue  # Agar expired hai toh agle link par jao
 
-        # ── Group mein bhejo ───────────────────────────────────────────────────
+        # ── 3. GROUP ME FORWARD ────────────────────────────────────────────────
         try:
             bot.send_message(
                 GROUP_CHAT_ID,
                 f"📢 <b>{title}</b>\n🔗 {url}",
                 parse_mode="HTML"
             )
+            # Link ko database/file me add karo taaki dobara na bheje
             sent_links.add(url)
             save_sent_links(sent_links)
             sent += 1
-            print(f"✅ Forwarded: {title}")
+            print(f"✅ Group me forward kiya: {title}")
         except Exception as e:
-            print(f"❌ Send error: {e}")
+            print(f"❌ Group me bhejne me error aaya: {e}")
 
-    # ── User ko reply ──────────────────────────────────────────────────────────
-    parts = []
-    if sent:
-        parts.append(f"✅ {sent} link(s) forward ho gaye!")
-    if duplicate:
-        parts.append(f"🔁 {duplicate} pehle se bhej chuke hain, skip kiya.")
-    if expired:
-        parts.append(f"⚠️ {expired} expired ya invalid hain, ignore kiya.")
+    # ── 4. USER KO REPORT REPLIES ──────────────────────────────────────────────
+    # Saare links process hone ke baad user ko final status reply milega
+    report = []
+    if sent > 0:
+        report.append(f"✅ {sent} naye link(s) forward ho gaye!")
+    if duplicate > 0:
+        report.append(f"🔁 {duplicate} duplicate link(s) ignore kiye gaye.")
+    if expired > 0:
+        report.append(f"⚠️ {expired} expired/invalid link(s) skip kiye gaye.")
 
-    bot.reply_to(message, "\n".join(parts) if parts else "Kuch nahi hua.")
+    # Agar kuch bhi forward ya skip hua toh short summary user ko bhej do
+    if report:
+        bot.reply_to(message, "\n".join(report))
+    else:
+        bot.reply_to(message, "Kuch process nahi hua.")
 
 
 # ── Start ──────────────────────────────────────────────────────────────────────
